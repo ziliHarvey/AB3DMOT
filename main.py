@@ -1,15 +1,11 @@
-# Author: Xinshuo Weng
-# email: xinshuo.weng@gmail.com
-# partially borrowed from SORT
-
 from __future__ import print_function
-import matplotlib; matplotlib.use('Agg')
 import os.path, copy, numpy as np, time, sys
 from numba import jit
 from sklearn.utils.linear_assignment_ import linear_assignment
 from filterpy.kalman import KalmanFilter
 from utils import load_list_from_folder, fileparts, mkdir_if_missing
 from scipy.spatial import ConvexHull
+import glob
 
 @jit    
 def poly_area(x,y):
@@ -93,28 +89,30 @@ def iou3d(corners1, corners2):
 
     '''
     # corner points are in counter clockwise order
-    rect1 = [(corners1[i,0], corners1[i,2]) for i in range(3,-1,-1)]
-    rect2 = [(corners2[i,0], corners2[i,2]) for i in range(3,-1,-1)] 
+    rect1 = [(corners1[i,0], corners1[i,1]) for i in range(4)]
+    rect2 = [(corners2[i,0], corners2[i,1]) for i in range(4)]
     area1 = poly_area(np.array(rect1)[:,0], np.array(rect1)[:,1])
     area2 = poly_area(np.array(rect2)[:,0], np.array(rect2)[:,1])
     inter, inter_area = convex_hull_intersection(rect1, rect2)
     iou_2d = inter_area/(area1+area2-inter_area)
-    ymax = min(corners1[0,1], corners2[0,1])
-    ymin = max(corners1[4,1], corners2[4,1])
-    inter_vol = inter_area * max(0.0, ymax-ymin)
+    zmax = min(corners1[0,2], corners2[0,2])
+    zmin = max(corners1[4,2], corners2[4,2])
+    if (inter_area > 0): print("inter_area ", inter_area)
+    inter_vol = inter_area * max(0.0, zmax-zmin)
     vol1 = box3d_vol(corners1)
     vol2 = box3d_vol(corners2)
     iou = inter_vol / (vol1 + vol2 - inter_vol)
+    # if (iou == 0): print("IOU ", iou)
     return iou, iou_2d
 
 @jit       
-def roty(t):
-    ''' Rotation about the y-axis. '''
+def rotz(t):
+    ''' Rotation about the z-axis. '''
     c = np.cos(t)
     s = np.sin(t)
-    return np.array([[c,  0,  s],
-                     [0,  1,  0],
-                     [-s, 0,  c]])
+    return np.array([[c,  -s,  0],
+                     [s,   c,  0],
+                     [0,   0,  1]])
 
 def convert_3dbox_to_8corner(bbox3d_input):
     ''' Takes an object and a projection matrix (P) and projects the 3d
@@ -126,7 +124,7 @@ def convert_3dbox_to_8corner(bbox3d_input):
     # compute rotational matrix around yaw axis
     bbox3d = copy.copy(bbox3d_input)
 
-    R = roty(bbox3d[3])    
+    R = rotz(bbox3d[3])    
 
     # 3d bounding box dimensions
     l = bbox3d[4]
@@ -134,9 +132,9 @@ def convert_3dbox_to_8corner(bbox3d_input):
     h = bbox3d[6]
     
     # 3d bounding box corners
-    x_corners = [l/2,l/2,-l/2,-l/2,l/2,l/2,-l/2,-l/2];
-    y_corners = [0,0,0,0,-h,-h,-h,-h];
-    z_corners = [w/2,-w/2,-w/2,w/2,w/2,-w/2,-w/2,w/2];
+    x_corners = [-l/2,-l/2,l/2,l/2,-l/2,-l/2,l/2,l/2];
+    y_corners = [w/2,-w/2,-w/2,w/2,w/2,-w/2,-w/2,w/2];
+    z_corners = [h/2,h/2,h/2,h/2,-h/2,-h/2,-h/2,-h/2];
     
     # rotate and translate 3d bounding box
     corners_3d = np.dot(R, np.vstack([x_corners,y_corners,z_corners]))
@@ -278,8 +276,8 @@ class KalmanBoxTracker(object):
     """
     return self.kf.x[:7].reshape((7, ))
 
-def associate_detections_to_trackers(detections,trackers,iou_threshold=0.01):     
-# def associate_detections_to_trackers(detections,trackers,iou_threshold=0.1):      # ablation study
+def associate_detections_to_trackers(detections,trackers,iou_threshold=0.1):
+# def associate_detections_to_trackers(detections,trackers,iou_threshold=0.01):     # ablation study
 # def associate_detections_to_trackers(detections,trackers,iou_threshold=0.25):
   """
   Assigns detections to tracked object (both represented as bounding boxes)
@@ -296,6 +294,7 @@ def associate_detections_to_trackers(detections,trackers,iou_threshold=0.01):
   for d,det in enumerate(detections):
     for t,trk in enumerate(trackers):
       iou_matrix[d,t] = iou3d(det,trk)[0]             # det: 8 x 3, trk: 8 x 3
+  # print(iou_matrix)
   matched_indices = linear_assignment(-iou_matrix)      # hougarian algorithm
 
   unmatched_detections = []
@@ -322,6 +321,7 @@ def associate_detections_to_trackers(detections,trackers,iou_threshold=0.01):
 
   return matches, np.array(unmatched_detections), np.array(unmatched_trackers)
 
+
 class AB3DMOT(object):
   def __init__(self,max_age=2,min_hits=3):      # max age will preserve the bbox does not appear no more than 2 frames, interpolate the detection
   # def __init__(self,max_age=3,min_hits=3):        # ablation study
@@ -334,8 +334,8 @@ class AB3DMOT(object):
     self.min_hits = min_hits
     self.trackers = []
     self.frame_count = 0
-    self.reorder = [3, 4, 5, 6, 2, 1, 0]
-    self.reorder_back = [6, 5, 4, 0, 1, 2, 3]
+    self.reorder = [0, 1, 2, 3, 5, 4, 6]
+    self.reorder_back = [0, 1, 2, 3, 5, 4, 6]
 
   def update(self,dets_all):
     """
@@ -394,64 +394,35 @@ class AB3DMOT(object):
           self.trackers.pop(i)
     if(len(ret)>0):
       return np.concatenate(ret)      # x, y, z, theta, l, w, h, ID, other info, confidence
-    return np.empty((0,15))      
-    
-if __name__ == '__main__':
-  if len(sys.argv)!=2:
-    print("Usage: python main.py result_sha(e.g., car_3d_det_test)")
-    sys.exit(1)
+    return np.empty((0,15))
 
-  result_sha = sys.argv[1]
-  save_root = './results'
-
-  det_id2str = {1:'Pedestrian', 2:'Car', 3:'Cyclist'}
-  seq_file_list, num_seq = load_list_from_folder(os.path.join('data/KITTI', result_sha))
-  total_time = 0.0
+def eval_sane():
+  data_dir = "data/KITTI/car_3d_sane/"
+  save_dir = "results/car_3d_sane/"
+  mkdir_if_missing(save_dir)
+  mot_tracker = AB3DMOT()
+  file_paths = sorted(glob.glob(data_dir + "*.txt"))
   total_frames = 0
-  save_dir = os.path.join(save_root, result_sha); mkdir_if_missing(save_dir)
-  eval_dir = os.path.join(save_dir, 'data'); mkdir_if_missing(eval_dir)
-  for seq_file in seq_file_list:
-    _, seq_name, _ = fileparts(seq_file)
-    mot_tracker = AB3DMOT() 
-    seq_dets = np.loadtxt(seq_file, delimiter=',') #load detections
-    eval_file = os.path.join(eval_dir, seq_name + '.txt'); eval_file = open(eval_file, 'w')
-    save_trk_dir = os.path.join(save_dir, 'trk_withid', seq_name); mkdir_if_missing(save_trk_dir)
-    print("Processing %s." % (seq_name))
-    for frame in range(int(seq_dets[:,0].min()), int(seq_dets[:,0].max()) + 1):
-      save_trk_file = os.path.join(save_trk_dir, '%06d.txt' % frame); save_trk_file = open(save_trk_file, 'w')
-      dets = seq_dets[seq_dets[:,0]==frame,7:14]
+  for file_path in file_paths:
+    frame = os.path.basename(file_path)[:3]
+    dets = np.loadtxt(file_path, delimiter=',')[:, 1:8]
+    print("Processing %s." % (frame))
 
-      ori_array = seq_dets[seq_dets[:,0]==frame,-1].reshape((-1, 1))
-      other_array = seq_dets[seq_dets[:,0]==frame,1:7]
-      additional_info = np.concatenate((ori_array, other_array), axis=1)
-      dets_all = {'dets': dets, 'info': additional_info}
-      total_frames += 1
-      start_time = time.time()
-      trackers = mot_tracker.update(dets_all)
-      cycle_time = time.time() - start_time
-      total_time += cycle_time
+    #fake data
+    ori_array = np.zeros((dets.shape[0], 1))
+    other_array = np.zeros((dets.shape[0], 7))
+    additional_info = np.concatenate((ori_array, other_array), axis=1)
+
+    dets_all = {'dets': dets, 'info': additional_info}
+    total_frames += 1
+    trackers = mot_tracker.update(dets_all)
+    with open(save_dir+frame+".txt", 'w') as f:
       for d in trackers:
-        bbox3d_tmp = d[0:7]
-        id_tmp = d[7]
-        ori_tmp = d[8]
-        type_tmp = det_id2str[d[9]]
-        bbox2d_tmp_trk = d[10:14]
-        conf_tmp = d[14]
-        
-        str_to_srite = '%s -1 -1 %f %f %f %f %f %f %f %f %f %f %f %f %f %d\n' % (type_tmp, ori_tmp,
-          bbox2d_tmp_trk[0], bbox2d_tmp_trk[1], bbox2d_tmp_trk[2], bbox2d_tmp_trk[3], 
-          bbox3d_tmp[0], bbox3d_tmp[1], bbox3d_tmp[2], bbox3d_tmp[3], bbox3d_tmp[4], bbox3d_tmp[5], bbox3d_tmp[6], 
-          conf_tmp, id_tmp)
-        save_trk_file.write(str_to_srite)
+        box = d[0:7]
+        id = d[7]
+        print('%d, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f' %
+           (int(id), box[0], box[1], box[2], box[3], box[4], box[5], box[6]), file=f)
+    f.close() 
 
-        str_to_srite = '%d %d %s 0 0 %f %f %f %f %f %f %f %f %f %f %f %f %f\n' % (frame, id_tmp, 
-          type_tmp, ori_tmp, bbox2d_tmp_trk[0], bbox2d_tmp_trk[1], bbox2d_tmp_trk[2], bbox2d_tmp_trk[3], 
-          bbox3d_tmp[0], bbox3d_tmp[1], bbox3d_tmp[2], bbox3d_tmp[3], bbox3d_tmp[4], bbox3d_tmp[5], bbox3d_tmp[6], 
-          conf_tmp)
-        eval_file.write(str_to_srite)
-
-      save_trk_file.close()
-
-    eval_file.close()
-      
-  print("Total Tracking took: %.3f for %d frames or %.1f FPS"%(total_time,total_frames,total_frames/total_time))
+if __name__ == '__main__':
+  eval_sane()
